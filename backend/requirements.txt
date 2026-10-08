@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pandas
+openpyxl
+xlrd
+scikit-learn
+statsmodels
+python-multipart
+prophet
+xgboost
