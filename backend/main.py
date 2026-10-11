@@ -9,7 +9,6 @@ from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 import xgboost as xgb
 from prophet import Prophet
@@ -96,7 +95,7 @@ def construir_features_temporales(df_in: pd.DataFrame, target_col: str = "cantid
     return df_feat
 
 def predecir_recursivo_arbol(modelo, df_completo: pd.DataFrame, fechas_futuro: pd.DatetimeIndex, target_col: str, feature_cols: list) -> list:
-    """Realiza una proyección autorregresiva recursiva multi-paso para modelos de Machine Learning (RF / XGBoost)."""
+    """Realiza una proyección autorregresiva recursiva multi-paso para modelos de Machine Learning (RF / XGBoost / Linear)."""
     df_sim = df_completo[['fecha', target_col, 'tasa_cumplimiento_sla', 'cantidad_pos']].copy() if 'tasa_cumplimiento_sla' in df_completo.columns and 'cantidad_pos' in df_completo.columns else df_completo[['fecha', target_col]].copy()
     
     if 'tasa_cumplimiento_sla' not in df_sim.columns:
@@ -107,7 +106,7 @@ def predecir_recursivo_arbol(modelo, df_completo: pd.DataFrame, fechas_futuro: p
     predicciones = []
     
     for f in fechas_futuro:
-        # Añadir temporalmente la fila futura con valor temporal nulo
+        # Fila temporal para el paso futuro
         nueva_fila = pd.DataFrame([{
             'fecha': f,
             target_col: np.nan,
@@ -120,7 +119,7 @@ def predecir_recursivo_arbol(modelo, df_completo: pd.DataFrame, fechas_futuro: p
         df_features = construir_features_temporales(df_temp, target_col=target_col)
         fila_features = df_features.iloc[[-1]][feature_cols].fillna(0)
         
-        # Inferencia
+        # Inferencia y redondeo
         pred_val = max(0, float(round(modelo.predict(fila_features)[0])))
         predicciones.append(int(pred_val))
         
@@ -193,7 +192,6 @@ async def upload_file(file: UploadFile = File(...)):
         if 'FECHAHORACREACION' in df.columns:
             df['FECHA_CORTA'] = df['FECHAHORACREACION'].dt.date
             
-            # Normalizar columnas de tipo y servicio
             df['TIPO_STR'] = df['TIPO'].astype(str).str.upper() if 'TIPO' in df.columns else ""
             df['SERVICE_STR'] = df['TIPOSERVICE'].astype(str).str.upper() if 'TIPOSERVICE' in df.columns else ""
             df['DERIVADO_NUM'] = df['DERIVADO'].fillna(0).astype(int) if 'DERIVADO' in df.columns else 0
@@ -212,7 +210,7 @@ async def upload_file(file: UploadFile = File(...)):
             df_agrupado['FECHA_CORTA'] = pd.to_datetime(df_agrupado['FECHA_CORTA'])
             df_agrupado.set_index('FECHA_CORTA', inplace=True)
             
-            # Reindex continuo para evitar huecos en la serie de tiempo
+            # Reindex continuo para evitar huecos en la serie temporal
             idx = pd.date_range(df_agrupado.index.min(), df_agrupado.index.max())
             df_agrupado = df_agrupado.reindex(idx).fillna({
                 'cantidad_total': 0,
@@ -226,7 +224,6 @@ async def upload_file(file: UploadFile = File(...)):
             df_agrupado.reset_index(inplace=True)
             df_agrupado.rename(columns={'index': 'fecha'}, inplace=True)
             
-            # Guardar tiempo promedio y datasets limpios
             with open("data/tiempo_promedio.txt", "w") as f:
                 f.write(str(tiempo_promedio))
                 
@@ -291,18 +288,14 @@ async def train_models(horizonte: int = 30, tipo_serie: str = "todos"):
     # Feature Engineering con Lags, Rolling y Calendario
     df_feat = construir_features_temporales(df, target_col=target_col)
     
-    # Columnas de características para los modelos tabulares
     feature_cols = [
         'dia_semana', 'es_fin_de_semana', 'dia_mes', 'es_quincena', 'es_feriado',
         'sin_dia_semana', 'cos_dia_semana', 'lag_1', 'lag_2', 'lag_7',
         'rolling_mean_7', 'rolling_std_7', 'lag_sla'
     ]
     
-    # Remover los primeros registros afectados por los lags para un entrenamiento limpio
     df_modelos = df_feat.dropna(subset=['lag_7', 'rolling_mean_7']).copy().reset_index(drop=True)
-    
     if len(df_modelos) < 15:
-        # Fallback a menos variables si la muestra es pequeña
         feature_cols = ['dia_semana', 'es_fin_de_semana', 'dia_mes', 'es_quincena', 'sin_dia_semana', 'cos_dia_semana']
         df_modelos = df_feat.copy()
 
@@ -315,229 +308,92 @@ async def train_models(horizonte: int = 30, tipo_serie: str = "todos"):
         
     resultados_modelos = []
     feature_importances_dict = {}
+    predicciones_por_modelo = {}
+    fechas_futuro = pd.date_range(start=df['fecha'].max() + pd.Timedelta(days=1), periods=horizonte)
 
-    # --- Modelo 1: Regresión Lineal (con Lags y Calendario) ---
-    try:
-        lr = LinearRegression()
-        lr.fit(train[feature_cols], train[target_col])
-        lr_preds = np.maximum(0, lr.predict(test[feature_cols]))
-        
-        resultados_modelos.append({
-            "nombre": "Regresión Lineal",
-            "mae": float(mean_absolute_error(test[target_col], lr_preds)),
-            "rmse": float(np.sqrt(mean_squared_error(test[target_col], lr_preds))),
-            "r2": float(r2_score(test[target_col], lr_preds)),
-            "mape": float(calcular_mape(test[target_col], lr_preds)),
-            "tipo": "linear"
-        })
-    except Exception as e:
-        print("Error en Regresión Lineal:", e)
-
-    # --- Modelo 2: Suavizado Exponencial (Holt-Winters con Tendencia Amortiguada) ---
-    try:
-        ts_train = train[target_col].values
-        es = ExponentialSmoothing(ts_train, seasonal_periods=7, trend='add', seasonal='add', damped_trend=True, initialization_method="estimated")
-        es_fit = es.fit()
-        es_preds = np.maximum(0, es_fit.forecast(len(test)))
-        
-        resultados_modelos.append({
-            "nombre": "Suavizado Exponencial",
-            "mae": float(mean_absolute_error(test[target_col], es_preds)),
-            "rmse": float(np.sqrt(mean_squared_error(test[target_col], es_preds))),
-            "r2": float(r2_score(test[target_col], es_preds)),
-            "mape": float(calcular_mape(test[target_col], es_preds)),
-            "tipo": "statsmodels"
-        })
-    except Exception as e:
-        print("Error en Suavizado Exponencial:", e)
-
-    # --- Modelo 3: Prophet con Regresores Exógenos ---
-    try:
-        df_prophet_train = train[['fecha', target_col, 'es_quincena', 'es_fin_de_semana', 'es_feriado']].copy()
-        df_prophet_train.rename(columns={'fecha': 'ds', target_col: 'y'}, inplace=True)
-        
-        m_prophet = Prophet(
-            weekly_seasonality=True,
-            daily_seasonality=False,
-            yearly_seasonality=False,
-            changepoint_prior_scale=0.08
-        )
-        m_prophet.add_regressor('es_quincena')
-        m_prophet.add_regressor('es_fin_de_semana')
-        m_prophet.add_regressor('es_feriado')
-        m_prophet.fit(df_prophet_train)
-        
-        df_prophet_test = test[['fecha', 'es_quincena', 'es_fin_de_semana', 'es_feriado']].copy()
-        df_prophet_test.rename(columns={'fecha': 'ds'}, inplace=True)
-        forecast_test = m_prophet.predict(df_prophet_test)
-        prophet_preds = np.maximum(0, forecast_test['yhat'].values)
-        
-        resultados_modelos.append({
-            "nombre": "Prophet",
-            "mae": float(mean_absolute_error(test[target_col], prophet_preds)),
-            "rmse": float(np.sqrt(mean_squared_error(test[target_col], prophet_preds))),
-            "r2": float(r2_score(test[target_col], prophet_preds)),
-            "mape": float(calcular_mape(test[target_col], prophet_preds)),
-            "tipo": "prophet"
-        })
-    except Exception as e:
-        print("Error en Prophet:", e)
-
-    # --- Modelo 4: ARIMA (Búsqueda de Orden Óptimo por AIC) ---
-    try:
-        ts_train = train[target_col].values
-        mejor_aic = float('inf')
-        mejor_orden = (1, 1, 1)
-        mejor_arima_fit = None
-        
-        for p in [1, 2]:
-            for d in [0, 1]:
-                for q in [0, 1]:
-                    try:
-                        m_cand = ARIMA(ts_train, order=(p, d, q))
-                        res_cand = m_cand.fit()
-                        if res_cand.aic < mejor_aic:
-                            mejor_aic = res_cand.aic
-                            mejor_orden = (p, d, q)
-                            mejor_arima_fit = res_cand
-                    except Exception:
-                        continue
-                        
-        if mejor_arima_fit is None:
-            mejor_arima_fit = ARIMA(ts_train, order=(1, 1, 1)).fit()
-            
-        arima_preds = np.maximum(0, mejor_arima_fit.forecast(steps=len(test)))
-        resultados_modelos.append({
-            "nombre": f"ARIMA {mejor_orden}",
-            "mae": float(mean_absolute_error(test[target_col], arima_preds)),
-            "rmse": float(np.sqrt(mean_squared_error(test[target_col], arima_preds))),
-            "r2": float(r2_score(test[target_col], arima_preds)),
-            "mape": float(calcular_mape(test[target_col], arima_preds)),
-            "tipo": "arima",
-            "orden": mejor_orden
-        })
-    except Exception as e:
-        print("Error en ARIMA:", e)
-
-    # --- Modelo 5: SARIMAX con Variables Exógenas ---
-    try:
-        ts_train = train[target_col].values
-        exog_cols = ['es_fin_de_semana', 'es_quincena']
-        exog_train = train[exog_cols].values
-        exog_test = test[exog_cols].values
-        
-        sarima = SARIMAX(
-            ts_train,
-            exog=exog_train,
-            order=(1, 1, 1),
-            seasonal_order=(1, 1, 0, 7),
-            enforce_stationarity=False,
-            enforce_invertibility=False
-        )
-        sarima_fit = sarima.fit(disp=False)
-        sarima_preds = np.maximum(0, sarima_fit.forecast(steps=len(test), exog=exog_test))
-        
-        resultados_modelos.append({
-            "nombre": "SARIMA (Exógeno)",
-            "mae": float(mean_absolute_error(test[target_col], sarima_preds)),
-            "rmse": float(np.sqrt(mean_squared_error(test[target_col], sarima_preds))),
-            "r2": float(r2_score(test[target_col], sarima_preds)),
-            "mape": float(calcular_mape(test[target_col], sarima_preds)),
-            "tipo": "sarima"
-        })
-    except Exception as e:
-        print("Error en SARIMA:", e)
-
-    # --- Modelo 6: Random Forest (con Lags y Regularización) ---
+    # =========================================================================
+    # 1. Random Forest (Multi-Step Recursivo)
+    # =========================================================================
     try:
         rf = RandomForestRegressor(n_estimators=100, max_depth=4, min_samples_leaf=2, random_state=42)
         rf.fit(train[feature_cols], train[target_col])
-        rf_preds = np.maximum(0, rf.predict(test[feature_cols]))
+        rf_test_preds = np.maximum(0, rf.predict(test[feature_cols]))
         
-        # Guardar importancia de variables
+        # Importancia de variables
         rf_imp = dict(zip(feature_cols, [round(float(v) * 100, 2) for v in rf.feature_importances_]))
         feature_importances_dict["Random Forest"] = dict(sorted(rf_imp.items(), key=lambda x: x[1], reverse=True))
         
+        # Proyección futura completa
+        rf_final = RandomForestRegressor(n_estimators=100, max_depth=4, min_samples_leaf=2, random_state=42)
+        rf_final.fit(df_modelos[feature_cols], df_modelos[target_col])
+        predicciones_por_modelo["Random Forest"] = predecir_recursivo_arbol(rf_final, df, fechas_futuro, target_col, feature_cols)
+        
         resultados_modelos.append({
             "nombre": "Random Forest",
-            "mae": float(mean_absolute_error(test[target_col], rf_preds)),
-            "rmse": float(np.sqrt(mean_squared_error(test[target_col], rf_preds))),
-            "r2": float(r2_score(test[target_col], rf_preds)),
-            "mape": float(calcular_mape(test[target_col], rf_preds)),
+            "mae": float(mean_absolute_error(test[target_col], rf_test_preds)),
+            "rmse": float(np.sqrt(mean_squared_error(test[target_col], rf_test_preds))),
+            "r2": float(r2_score(test[target_col], rf_test_preds)),
+            "mape": float(calcular_mape(test[target_col], rf_test_preds)),
             "tipo": "random_forest"
         })
     except Exception as e:
         print("Error en Random Forest:", e)
 
-    # --- Modelo 7: XGBoost (con Regularización y Lags) ---
+    # =========================================================================
+    # 2. XGBoost (Multi-Step Recursivo)
+    # =========================================================================
     try:
         xgb_model = xgb.XGBRegressor(
-            n_estimators=80,
-            max_depth=3,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42
+            n_estimators=80, max_depth=3, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, random_state=42
         )
         xgb_model.fit(train[feature_cols], train[target_col])
-        xgb_preds = np.maximum(0, xgb_model.predict(test[feature_cols]))
+        xgb_test_preds = np.maximum(0, xgb_model.predict(test[feature_cols]))
         
         xgb_imp = dict(zip(feature_cols, [round(float(v) * 100, 2) for v in xgb_model.feature_importances_]))
         feature_importances_dict["XGBoost"] = dict(sorted(xgb_imp.items(), key=lambda x: x[1], reverse=True))
         
+        xgb_final = xgb.XGBRegressor(
+            n_estimators=80, max_depth=3, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, random_state=42
+        )
+        xgb_final.fit(df_modelos[feature_cols], df_modelos[target_col])
+        predicciones_por_modelo["XGBoost"] = predecir_recursivo_arbol(xgb_final, df, fechas_futuro, target_col, feature_cols)
+        
         resultados_modelos.append({
             "nombre": "XGBoost",
-            "mae": float(mean_absolute_error(test[target_col], xgb_preds)),
-            "rmse": float(np.sqrt(mean_squared_error(test[target_col], xgb_preds))),
-            "r2": float(r2_score(test[target_col], xgb_preds)),
-            "mape": float(calcular_mape(test[target_col], xgb_preds)),
+            "mae": float(mean_absolute_error(test[target_col], xgb_test_preds)),
+            "rmse": float(np.sqrt(mean_squared_error(test[target_col], xgb_test_preds))),
+            "r2": float(r2_score(test[target_col], xgb_test_preds)),
+            "mape": float(calcular_mape(test[target_col], xgb_test_preds)),
             "tipo": "xgboost"
         })
     except Exception as e:
         print("Error en XGBoost:", e)
 
-    if not resultados_modelos:
-        raise HTTPException(status_code=500, detail="Fallo el entrenamiento de todos los modelos.")
-
-    # Selección del mejor modelo (menor MAE)
-    mejor_modelo_info = min(resultados_modelos, key=lambda x: x['mae'])
-    
-    # --- Proyección Futura a N días ---
-    fechas_futuro = pd.date_range(start=df['fecha'].max() + pd.Timedelta(days=1), periods=horizonte)
-    predicciones_futuro = []
-    
-    if mejor_modelo_info['tipo'] in ["random_forest", "xgboost", "linear"]:
-        if mejor_modelo_info['tipo'] == "random_forest":
-            modelo_final = RandomForestRegressor(n_estimators=100, max_depth=4, min_samples_leaf=2, random_state=42)
-        elif mejor_modelo_info['tipo'] == "xgboost":
-            modelo_final = xgb.XGBRegressor(n_estimators=80, max_depth=3, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, random_state=42)
-        else:
-            modelo_final = LinearRegression()
-            
-        modelo_final.fit(df_modelos[feature_cols], df_modelos[target_col])
-        predicciones_futuro = predecir_recursivo_arbol(modelo_final, df, fechas_futuro, target_col, feature_cols)
+    # =========================================================================
+    # 3. Prophet (con Regresores Exógenos de Calendario y Quincenas)
+    # =========================================================================
+    try:
+        df_prophet_train = train[['fecha', target_col, 'es_quincena', 'es_fin_de_semana', 'es_feriado']].copy()
+        df_prophet_train.rename(columns={'fecha': 'ds', target_col: 'y'}, inplace=True)
         
-    elif mejor_modelo_info['tipo'] == "statsmodels":
-        ts_data_all = df[target_col].values
-        try:
-            es_final = ExponentialSmoothing(ts_data_all, seasonal_periods=7, trend='add', seasonal='add', damped_trend=True, initialization_method="estimated")
-            es_final_fit = es_final.fit()
-        except Exception:
-            es_final = ExponentialSmoothing(ts_data_all, trend='add', seasonal=None, damped_trend=True, initialization_method="estimated")
-            es_final_fit = es_final.fit()
-        preds = es_final_fit.forecast(horizonte)
-        predicciones_futuro = [max(0, int(round(p))) for p in preds]
+        m_prophet = Prophet(weekly_seasonality=True, daily_seasonality=False, yearly_seasonality=False, changepoint_prior_scale=0.08)
+        m_prophet.add_regressor('es_quincena')
+        m_prophet.add_regressor('es_fin_de_semana')
+        m_prophet.add_regressor('es_feriado')
+        m_prophet.fit(df_prophet_train)
         
-    elif mejor_modelo_info['tipo'] == "prophet":
-        df_prophet_all = construir_features_temporales(df, target_col=target_col)
-        df_prophet_all = df_prophet_all[['fecha', target_col, 'es_quincena', 'es_fin_de_semana', 'es_feriado']].copy()
-        df_prophet_all.rename(columns={'fecha': 'ds', target_col: 'y'}, inplace=True)
+        df_prophet_test = test[['fecha', 'es_quincena', 'es_fin_de_semana', 'es_feriado']].copy().rename(columns={'fecha': 'ds'})
+        prophet_test_preds = np.maximum(0, m_prophet.predict(df_prophet_test)['yhat'].values)
         
-        m_final = Prophet(weekly_seasonality=True, daily_seasonality=False, yearly_seasonality=False, changepoint_prior_scale=0.08)
-        m_final.add_regressor('es_quincena')
-        m_final.add_regressor('es_fin_de_semana')
-        m_final.add_regressor('es_feriado')
-        m_final.fit(df_prophet_all)
+        # Proyección futura completa
+        df_prophet_all = df_feat[['fecha', target_col, 'es_quincena', 'es_fin_de_semana', 'es_feriado']].copy().rename(columns={'fecha': 'ds', target_col: 'y'})
+        m_prophet_final = Prophet(weekly_seasonality=True, daily_seasonality=False, yearly_seasonality=False, changepoint_prior_scale=0.08)
+        m_prophet_final.add_regressor('es_quincena')
+        m_prophet_final.add_regressor('es_fin_de_semana')
+        m_prophet_final.add_regressor('es_feriado')
+        m_prophet_final.fit(df_prophet_all)
         
         feriados = obtener_feriados_peru()
         df_futuro_prophet = pd.DataFrame({'ds': fechas_futuro})
@@ -547,31 +403,137 @@ async def train_models(horizonte: int = 30, tipo_serie: str = "todos"):
         df_futuro_prophet['es_quincena'] = df_futuro_prophet['dia_mes'].isin([14, 15, 16, 28, 29, 30, 31]).astype(int)
         df_futuro_prophet['es_feriado'] = df_futuro_prophet['ds'].dt.date.apply(lambda d: 1 if d in feriados else 0)
         
-        preds_df = m_final.predict(df_futuro_prophet)
-        predicciones_futuro = [max(0, int(round(p))) for p in preds_df['yhat']]
+        preds_p = m_prophet_final.predict(df_futuro_prophet)['yhat']
+        predicciones_por_modelo["Prophet"] = [max(0, int(round(p))) for p in preds_p]
         
-    elif mejor_modelo_info['tipo'] == "arima":
-        ts_data_all = df[target_col].values
-        orden = mejor_modelo_info.get('orden', (1, 1, 1))
-        arima_final = ARIMA(ts_data_all, order=orden)
-        arima_final_fit = arima_final.fit()
-        preds = arima_final_fit.forecast(steps=horizonte)
-        predicciones_futuro = [max(0, int(round(p))) for p in preds]
+        resultados_modelos.append({
+            "nombre": "Prophet",
+            "mae": float(mean_absolute_error(test[target_col], prophet_test_preds)),
+            "rmse": float(np.sqrt(mean_squared_error(test[target_col], prophet_test_preds))),
+            "r2": float(r2_score(test[target_col], prophet_test_preds)),
+            "mape": float(calcular_mape(test[target_col], prophet_test_preds)),
+            "tipo": "prophet"
+        })
+    except Exception as e:
+        print("Error en Prophet:", e)
+
+    # =========================================================================
+    # 4. SARIMA (Estacional Semanal: Captura ciclos de 7 días naturales)
+    # =========================================================================
+    try:
+        ts_train = train[target_col].values
+        # SARIMA con orden estacional semanal (1, 0, 1, 7) sin sobre-diferenciación
+        sarima_model = SARIMAX(
+            ts_train,
+            order=(1, 0, 1),
+            seasonal_order=(1, 0, 1, 7),
+            enforce_stationarity=False,
+            enforce_invertibility=False
+        )
+        sarima_fit = sarima_model.fit(disp=False)
+        sarima_test_preds = np.maximum(0, sarima_fit.forecast(steps=len(test)))
         
-    elif mejor_modelo_info['tipo'] == "sarima":
-        ts_data_all = df[target_col].values
-        df_feat_all = construir_features_temporales(df, target_col=target_col)
-        exog_cols = ['es_fin_de_semana', 'es_quincena']
-        exog_all = df_feat_all[exog_cols].values
+        # Proyección futura completa
+        ts_all = df[target_col].values
+        sarima_final = SARIMAX(
+            ts_all,
+            order=(1, 0, 1),
+            seasonal_order=(1, 0, 1, 7),
+            enforce_stationarity=False,
+            enforce_invertibility=False
+        ).fit(disp=False)
+        preds_sarima = sarima_final.forecast(steps=horizonte)
+        predicciones_por_modelo["SARIMA (Estacional)"] = [max(0, int(round(p))) for p in preds_sarima]
         
-        df_futuro_feat = pd.DataFrame({'fecha': fechas_futuro})
-        df_futuro_feat = construir_features_temporales(df_futuro_feat, target_col=target_col)
-        exog_futuro = df_futuro_feat[exog_cols].values
+        resultados_modelos.append({
+            "nombre": "SARIMA (Estacional)",
+            "mae": float(mean_absolute_error(test[target_col], sarima_test_preds)),
+            "rmse": float(np.sqrt(mean_squared_error(test[target_col], sarima_test_preds))),
+            "r2": float(r2_score(test[target_col], sarima_test_preds)),
+            "mape": float(calcular_mape(test[target_col], sarima_test_preds)),
+            "tipo": "sarima"
+        })
+    except Exception as e:
+        print("Error en SARIMA:", e)
+
+    # =========================================================================
+    # 5. Suavizado Exponencial (Holt-Winters con Ciclo Semanal y Damped Trend)
+    # =========================================================================
+    try:
+        ts_train = train[target_col].values
+        es = ExponentialSmoothing(
+            ts_train, seasonal_periods=7, trend='add', seasonal='add',
+            damped_trend=True, initialization_method="estimated"
+        )
+        es_fit = es.fit()
+        es_test_preds = np.maximum(0, es_fit.forecast(len(test)))
         
-        sarima_final = SARIMAX(ts_data_all, exog=exog_all, order=(1, 1, 1), seasonal_order=(1, 1, 0, 7), enforce_stationarity=False, enforce_invertibility=False)
-        sarima_final_fit = sarima_final.fit(disp=False)
-        preds = sarima_final_fit.forecast(steps=horizonte, exog=exog_futuro)
-        predicciones_futuro = [max(0, int(round(p))) for p in preds]
+        # Proyección futura completa
+        ts_all = df[target_col].values
+        try:
+            es_final = ExponentialSmoothing(
+                ts_all, seasonal_periods=7, trend='add', seasonal='add',
+                damped_trend=True, initialization_method="estimated"
+            ).fit()
+        except Exception:
+            es_final = ExponentialSmoothing(
+                ts_all, seasonal_periods=7, trend=None, seasonal='add',
+                initialization_method="estimated"
+            ).fit()
+            
+        preds_hw = es_final.forecast(horizonte)
+        predicciones_por_modelo["Suavizado Exponencial"] = [max(0, int(round(p))) for p in preds_hw]
+        
+        resultados_modelos.append({
+            "nombre": "Suavizado Exponencial",
+            "mae": float(mean_absolute_error(test[target_col], es_test_preds)),
+            "rmse": float(np.sqrt(mean_squared_error(test[target_col], es_test_preds))),
+            "r2": float(r2_score(test[target_col], es_test_preds)),
+            "mape": float(calcular_mape(test[target_col], es_test_preds)),
+            "tipo": "statsmodels"
+        })
+    except Exception as e:
+        print("Error en Suavizado Exponencial:", e)
+
+    # =========================================================================
+    # 6. Regresión Lineal (con Lags y Calendario)
+    # =========================================================================
+    try:
+        lr = LinearRegression()
+        lr.fit(train[feature_cols], train[target_col])
+        lr_test_preds = np.maximum(0, lr.predict(test[feature_cols]))
+        
+        lr_final = LinearRegression()
+        lr_final.fit(df_modelos[feature_cols], df_modelos[target_col])
+        predicciones_por_modelo["Regresión Lineal"] = predecir_recursivo_arbol(lr_final, df, fechas_futuro, target_col, feature_cols)
+        
+        resultados_modelos.append({
+            "nombre": "Regresión Lineal",
+            "mae": float(mean_absolute_error(test[target_col], lr_test_preds)),
+            "rmse": float(np.sqrt(mean_squared_error(test[target_col], lr_test_preds))),
+            "r2": float(r2_score(test[target_col], lr_test_preds)),
+            "mape": float(calcular_mape(test[target_col], lr_test_preds)),
+            "tipo": "linear"
+        })
+    except Exception as e:
+        print("Error en Regresión Lineal:", e)
+
+    if not resultados_modelos:
+        raise HTTPException(status_code=500, detail="Fallo el entrenamiento de todos los modelos.")
+
+    # =========================================================================
+    # Selección del Mejor Modelo Recomendado (Criterio de Realismo y Menor MAE)
+    # =========================================================================
+    # Para ser un pronóstico operativo realista, la proyección debe reflejar la
+    # dinámica semanal del negocio (desviación estándar mayor a 1.0 para evitar líneas planas triviales)
+    candidatos_reales = [
+        m for m in resultados_modelos
+        if np.std(predicciones_por_modelo.get(m['nombre'], [0])) > 1.0
+    ]
+    if candidatos_reales:
+        mejor_modelo_info = min(candidatos_reales, key=lambda x: x['mae'])
+    else:
+        mejor_modelo_info = min(resultados_modelos, key=lambda x: x['mae'])
 
     # Tiempo promedio histórico de resolución
     tiempo_prom_historico = 45.0
@@ -596,12 +558,13 @@ async def train_models(horizonte: int = 30, tipo_serie: str = "todos"):
             for m in resultados_modelos
         ],
         "mejor_modelo": mejor_modelo_info['nombre'],
+        "predicciones_por_modelo": predicciones_por_modelo,
+        "valores_proyectados": predicciones_por_modelo.get(mejor_modelo_info['nombre'], []),
         "horizonte_dias": horizonte,
         "tipo_serie": tipo_serie,
-        "importancia_variables": feature_importances_dict.get(mejor_modelo_info['nombre'], feature_importances_dict.get("XGBoost", feature_importances_dict.get("Random Forest", {}))),
+        "importancia_variables": feature_importances_dict.get(mejor_modelo_info['nombre'], feature_importances_dict.get("Random Forest", feature_importances_dict.get("XGBoost", {}))),
         "fechas_historicas": df['fecha'].dt.strftime("%Y-%m-%d").tolist(),
         "valores_historicos": df[target_col].tolist(),
         "fechas_proyectadas": [f.strftime("%Y-%m-%d") for f in fechas_futuro],
-        "valores_proyectados": predicciones_futuro,
         "tiempo_promedio_historico": round(tiempo_prom_historico, 2)
     }

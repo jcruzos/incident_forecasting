@@ -72,7 +72,7 @@ if st.session_state.get('data_loaded', False):
     horizonte = st.sidebar.slider("Días a proyectar (Horizonte)", min_value=7, max_value=90, value=30)
     
     if st.sidebar.button("Entrenar Modelos y Proyectar"):
-        with st.spinner(f"Entrenando 7 modelos predictivos con Lags, Quincenas y Rolling Features para '{serie_seleccionada_label}'..."):
+        with st.spinner(f"Entrenando y proyectando todos los modelos para '{serie_seleccionada_label}'..."):
             try:
                 res = requests.post(
                     f"{BACKEND_URL}/train",
@@ -81,7 +81,7 @@ if st.session_state.get('data_loaded', False):
                 if res.status_code == 200:
                     st.session_state['forecast_data'] = res.json()
                     st.session_state['serie_label'] = serie_seleccionada_label
-                    st.sidebar.success("¡Modelos entrenados y optimizados con éxito!")
+                    st.sidebar.success("¡Modelos entrenados y proyectados con éxito!")
                 else:
                     error_msg = res.text
                     try:
@@ -99,24 +99,52 @@ if st.session_state.get('forecast_data'):
     
     st.header(f"Resultados de la Proyección: {serie_label}")
     
-    # 1. Tarjetas de KPIs
+    # -------------------------------------------------------------
+    # Selector de Modelo por el Usuario
+    # -------------------------------------------------------------
+    predicciones_dict = fdata.get('predicciones_por_modelo', {})
+    mejor_modelo_rec = fdata.get('mejor_modelo', 'Desconocido')
+    
+    lista_nombres_modelos = list(predicciones_dict.keys()) if predicciones_dict else [mejor_modelo_rec]
+    
+    # Construir opciones poniendo el recomendado al inicio
+    opciones_selector = [f"🏆 {mejor_modelo_rec} (Recomendado por menor error)"] + [m for m in lista_nombres_modelos if m != mejor_modelo_rec]
+    
+    col_sel_1, col_sel_2 = st.columns([2, 2])
+    with col_sel_1:
+        modelo_seleccionado_str = st.selectbox(
+            "🎯 Selecciona el Modelo para la Proyección:",
+            opciones_selector,
+            index=0
+        )
+        
+    modelo_activo = mejor_modelo_rec if "(Recomendado" in modelo_seleccionado_str else modelo_seleccionado_str
+    valores_proy_activo = predicciones_dict.get(modelo_activo, fdata.get('valores_proyectados', []))
+    
+    with col_sel_2:
+        modelos_para_comparar = [m for m in lista_nombres_modelos if m != modelo_activo]
+        modelos_overlay = st.multiselect(
+            "👁️ Superponer otros modelos para comparar curvas:",
+            modelos_para_comparar
+        )
+
+    # 1. Tarjetas de KPIs Reactivas
     col1, col2, col3, col4 = st.columns(4)
     total_hist = sum(fdata['valores_historicos'])
     col1.metric("Volumen Histórico Total", f"{total_hist:,}")
-    col2.metric("Mejor Modelo Encontrado", fdata['mejor_modelo'])
+    col2.metric("Modelo Activo en Gráfico", modelo_activo)
     col3.metric("Días Proyectados", f"{fdata['horizonte_dias']} días")
-    total_proy = sum(fdata['valores_proyectados'])
+    total_proy = sum(valores_proy_activo)
     col4.metric("Volumen Proyectado Acumulado", f"{total_proy:,}")
     
     st.markdown("---")
     
     # 2. Gráfico Interactivo de Histórico + Predicción
-    st.subheader(f"Tendencia Histórica y Proyección a {fdata['horizonte_dias']} días ({fdata['mejor_modelo']})")
+    st.subheader(f"Tendencia Histórica y Proyección ({modelo_activo})")
     
     fechas_hist = pd.to_datetime(fdata['fechas_historicas'])
     valores_hist = fdata['valores_historicos']
     fechas_proy = pd.to_datetime(fdata['fechas_proyectadas'])
-    valores_proy = fdata['valores_proyectados']
     
     fig = go.Figure()
     
@@ -129,15 +157,29 @@ if st.session_state.get('forecast_data'):
         line=dict(color='#1f77b4', width=2)
     ))
                      
-    # Línea Predicción Futura
+    # Línea Predicción Futura del Modelo Seleccionado
     fig.add_trace(go.Scatter(
         x=fechas_proy,
-        y=valores_proy,
+        y=valores_proy_activo,
         mode='lines+markers',
-        name=f"Proyección ({fdata['mejor_modelo']})",
-        line=dict(color='#ff7f0e', dash='dash', width=2),
+        name=f"Proyección: {modelo_activo}",
+        line=dict(color='#ff7f0e', dash='dash', width=2.5),
         marker=dict(size=6, symbol='circle')
     ))
+    
+    # Líneas Superpuestas para Comparar
+    paleta_colores = ['#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    for idx_color, mod_comp in enumerate(modelos_overlay):
+        if mod_comp in predicciones_dict:
+            c = paleta_colores[idx_color % len(paleta_colores)]
+            fig.add_trace(go.Scatter(
+                x=fechas_proy,
+                y=predicciones_dict[mod_comp],
+                mode='lines+markers',
+                name=f"Comparativa: {mod_comp}",
+                line=dict(color=c, dash='dot', width=1.5),
+                marker=dict(size=4, symbol='diamond')
+            ))
                      
     fig.update_layout(
         xaxis_title='Fecha',
@@ -153,21 +195,23 @@ if st.session_state.get('forecast_data'):
     
     with col_izq:
         st.subheader("📊 Evaluación Comparativa de Modelos")
-        st.markdown("**Métricas calculadas:** MAE, RMSE, R² y MAPE (%). El modelo con menor MAE es seleccionado automáticamente.")
+        st.markdown("**Métricas calculadas:** MAE, RMSE, R² y MAPE (%). Los modelos con estacionalidad capturan los picos y valles semanales.")
         
         eval_df = pd.DataFrame(fdata['modelos_evaluados'])
         cols_mostrar = [c for c in ['nombre', 'mae', 'rmse', 'r2', 'mape'] if c in eval_df.columns]
         eval_df = eval_df[cols_mostrar]
         
-        # Resaltado con estilo de menor error
+        # Resaltado condicional
         styled_df = eval_df.style.highlight_min(subset=[c for c in ['mae', 'rmse', 'mape'] if c in eval_df.columns], color='lightgreen')
         if 'r2' in eval_df.columns:
             styled_df = styled_df.highlight_max(subset=['r2'], color='lightgreen')
             
         st.dataframe(styled_df, use_container_width=True)
         
+        st.info(f"💡 **Modelo Activo Seleccionado:** `{modelo_activo}`. Si deseas probar cómo cambia el pronóstico, puedes cambiar el selector arriba.")
+        
     with col_der:
-        st.subheader("👥 Planificación de Capacidad de Soporte")
+        st.subheader(f"👥 Planificación de Capacidad ({modelo_activo})")
         
         horas_productivas = st.slider(
             "Horas útiles por técnico al día (Jornada neta sin refrigerio)",
@@ -175,11 +219,11 @@ if st.session_state.get('forecast_data'):
         )
         
         tiempo_prom_minutos = fdata.get('tiempo_promedio_historico', 45.0)
-        st.markdown(f"**Tiempo medio por ticket estimado:** `{round(tiempo_prom_minutos, 1)}` minutos")
+        st.markdown(f"**Tiempo medio por ticket:** `{round(tiempo_prom_minutos, 1)}` min | **Tickets proyectados:** `{sum(valores_proy_activo):,}`")
         
         df_capacidad = pd.DataFrame({
             'Fecha': fechas_proy.dt.strftime("%Y-%m-%d") if hasattr(fechas_proy, 'dt') else pd.to_datetime(fechas_proy).strftime("%Y-%m-%d"),
-            'Tickets Estimados': valores_proy
+            'Tickets Estimados': valores_proy_activo
         })
         
         df_capacidad['Carga (Horas)'] = ((df_capacidad['Tickets Estimados'] * tiempo_prom_minutos) / 60).round(1)
@@ -195,9 +239,9 @@ if st.session_state.get('forecast_data'):
             
         csv_capacidad = df_capacidad.to_csv(index=False).encode('utf-8')
         st.download_button(
-            label="📥 Descargar Plan de Personal (CSV)",
+            label=f"📥 Descargar Plan de Personal ({modelo_activo}) CSV",
             data=csv_capacidad,
-            file_name=f'plan_personal_{fdata.get("tipo_serie", "tickets")}.csv',
+            file_name=f'plan_personal_{modelo_activo.replace(" ", "_")}.csv',
             mime='text/csv'
         )
 
@@ -206,12 +250,11 @@ if st.session_state.get('forecast_data'):
     if imp_dict:
         st.markdown("---")
         st.subheader("🧠 Explicabilidad del Modelo: Importancia de Variables (Feature Importance)")
-        st.markdown("Muestra qué variables de calendario, rezago o negocio tienen mayor peso relativo en las proyecciones.")
+        st.markdown("Muestra qué variables de calendario, rezago o negocio tienen mayor peso en las decisiones del modelo.")
         
         df_imp = pd.DataFrame(list(imp_dict.items()), columns=['Variable', 'Importancia (%)'])
         df_imp = df_imp.sort_values('Importancia (%)', ascending=True)
         
-        # Mapeo de nombres descriptivos
         nombres_amigables = {
             'lag_1': 'Incidentes de ayer (Lag 1)',
             'lag_2': 'Incidentes hace 2 días (Lag 2)',
@@ -234,7 +277,7 @@ if st.session_state.get('forecast_data'):
             x='Importancia (%)',
             y='Variable_Descriptiva',
             orientation='h',
-            title=f"Peso Relativo de Características en {fdata['mejor_modelo']}",
+            title=f"Peso Relativo de Características en el Modelo",
             color='Importancia (%)',
             color_continuous_scale='Blues'
         )
@@ -246,11 +289,8 @@ else:
     
     st.markdown("""
     ### 🚀 Novedades del Motor Predictivo:
-    1. **Feature Engineering Avanzado:** Incorporación de variables rezagadas (`lag_1`, `lag_7`), tendencias móviles (`rolling_mean_7`), y marcadores comerciales (quincenas, fines de semana y feriados).
-    2. **Segmentación Flexible:** Puedes proyectar el total consolidado, solo incidentes críticos o solo la demanda de soporte POS en tiendas.
-    3. **Modelos Exógenos y Recursivos:**
-       * **SARIMAX y Prophet:** Integran variables externas como quincenas y feriados.
-       * **Random Forest y XGBoost:** Utilizan inferencia autorregresiva recursiva para evitar estimaciones planas en el horizonte.
-    4. **Métricas Completas:** Comparación simultánea con **MAE**, **RMSE**, **R²** y **MAPE (%)**.
-    5. **Explicabilidad:** Identificación visual de los factores que más influyen en las incidencias.
+    1. **Selección Manual y Comparación Multi-Modelo:** Puedes elegir ver cualquier modelo entrenado y superponer varios en el gráfico simultáneamente.
+    2. **Modelos con Ciclo Semanal Real:** Todos los modelos (SARIMA, Prophet, Random Forest, XGBoost, Holt-Winters) generan oscilaciones naturales acordes a la operación real.
+    3. **Feature Engineering Avanzado:** Lags (`lag_1`, `lag_7`), tendencias móviles (`rolling_mean_7`), quincenas y feriados.
+    4. **Planificación de Capacidad Dinámica:** Calcula el personal técnico necesario basándose en el modelo que tú decidas activar.
     """)
