@@ -59,7 +59,12 @@ if st.session_state.get('data_loaded', False):
                     st.session_state['forecast_data'] = res.json()
                     st.sidebar.success("Modelos entrenados correctamente.")
                 else:
-                    st.sidebar.error(f"Error entrenando: {res.json().get('detail', 'Desconocido')}")
+                    error_msg = res.text
+                    try:
+                        error_msg = res.json().get('detail', res.text)
+                    except Exception:
+                        pass
+                    st.sidebar.error(f"Error entrenando: {error_msg}")
             except Exception as e:
                 st.sidebar.error(f"Error de conexión: {e}")
 
@@ -137,7 +142,7 @@ if st.session_state.get('forecast_data'):
         })
         
         # Formula: (Tickets * Minutos) / 60 = Horas necesarias. Luego Horas necesarias / Horas Productivas por persona
-        df_capacidad['Carga(Horas)'] = (df_capacidad['Tickets Estimados'] * tiempo_prom_minutos) / 60
+        df_capacidad['Carga (Horas)'] = (df_capacidad['Tickets Estimados'] * tiempo_prom_minutos) / 60
         # Redondeo hacia arriba para asegurar que siempre haya suficiente personal
         df_capacidad['Tecnicos Requeridos'] = (df_capacidad['Carga (Horas)'] / horas_productivas).apply(lambda x: max(1, int(x + 0.99)))
         
@@ -146,7 +151,7 @@ if st.session_state.get('forecast_data'):
         
         # Mostrar tabla coloreada
         st.dataframe(
-            df_capacidad.style.backgorund_gradient(subset=['Tecnicos Requeridos'], cmap='Oranges'),
+            df_capacidad.style.background_gradient(subset=['Tecnicos Requeridos'], cmap='Oranges'),
             use_container_width=True
         )
         
@@ -156,7 +161,7 @@ if st.session_state.get('forecast_data'):
             label="Descargar Plan de Personal CSV",
             data=csv_capacidad,
             file_name='plan_capacidad_soporte.csv',
-            nime='text/csv',
+            mime='text/csv',
         ) 
       #  st.subheader("Datos Proyectados (Futuro)")
        # df_proy = pd.DataFrame({

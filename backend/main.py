@@ -27,45 +27,57 @@ async def upload_file(file: UploadFile = File (...)):
         contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
         
-        # 1. Cargar matriz SLA
-        ruta_sla = os.path.join(os.path.dirname(__file__),"data", "sla_atencion_soporte.xlsx")
-        print(f"Buscando SLA en: {ruta_sla}")
+        # 1. Cargar matriz SLA buscando en posibles rutas del servidor
+        posibles_rutas_sla = [
+            os.path.join(os.path.dirname(__file__), "data", "sla_atencion_soporte.xlsx"),
+            os.path.join("data", "sla_atencion_soporte.xlsx"),
+            os.path.join(os.path.dirname(__file__), "data", "SLA DE ATENCION SOPORTE.xlsx"),
+            os.path.join("data", "SLA DE ATENCION SOPORTE.xlsx"),
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "SLA DE ATENCION SOPORTE.xlsx"),
+            os.path.join(".", "SLA DE ATENCION SOPORTE.xlsx"),
+            os.path.join(".", "sla_atencion_soporte.xlsx")
+        ]
+        ruta_sla = next((p for p in posibles_rutas_sla if os.path.exists(p)), None)
+        print(f"Ruta SLA seleccionada: {ruta_sla}")
         
-        if not os.path.exists(ruta_sla):
-            if os.path.exists(os.path.dirname(ruta_sla)):
-             print (f"Archivos en carpeta data: {os.listdir(os.path.dirname(ruta_sla))}")
+        if not ruta_sla:
+            carpetas_debug = [os.path.join(os.path.dirname(__file__), "data"), "data"]
+            for c in carpetas_debug:
+                if os.path.exists(c):
+                    print(f"Archivos en carpeta {c}: {os.listdir(c)}")
             raise HTTPException(status_code=500, detail="Falta el archivo maestro SLA en el servidor.")
         
         df_sla = pd.read_excel(ruta_sla)
         
-        #Estandarizar nombres de columnas
+        # Estandarizar nombres de columnas
         df.columns = df.columns.str.strip().str.upper()
         df_sla.columns = df_sla.columns.str.strip().str.upper()
         
         # 2. Filtrar solo incidencias y solicitudes (excluir tareas programadas)
-        if 'Tipo' in df.columns:
+        if 'TIPO' in df.columns:
             df = df[df['TIPO'].astype(str).str.upper().isin(['INCIDENTE','SOLICITUD'])]  
         
         # 3. Cruce de dataframes por Categoria
         if 'CATEGORIA' in df.columns and 'CATEGORIA' in df_sla.columns:
             df = df.merge(df_sla[['CATEGORIA','SLA_MINUTOS']], on='CATEGORIA', how='left')
         else:
-            df['SLA_MINUTOS'] = 120 #Valor por defecto si fallan las columnas
+            df['SLA_MINUTOS'] = 120 # Valor por defecto si fallan las columnas
             
         # 4. Calculo de tiempos reales y cumplimiento SLA
         if 'FECHAHORACREACION' in df.columns and 'FECHAHORACIERRE' in df.columns:
-            df['FECHAHORACREACION'] = pd.to_Datetime(df['FECHAHORACREACION'], errors='coerce')
-            df['FECHAHORACIERRE'] = pd.to_datetime (df['FECHAHORACIERRE'],errors='coerce')
+            df['FECHAHORACREACION'] = pd.to_datetime(df['FECHAHORACREACION'], errors='coerce')
+            df['FECHAHORACIERRE'] = pd.to_datetime(df['FECHAHORACIERRE'], errors='coerce')
             
-            #Calcular minutos reales
+            # Calcular minutos reales
             df['MINUTOS_REALES'] = (df['FECHAHORACIERRE'] - df['FECHAHORACREACION']).dt.total_seconds() / 60
             
             # Etiquetar cumplimiento (1 = cumple, 0 = no cumple)
-            df ['CUMPLE_SLA'] = (df['MINUTOS_REALES'] <= df['SLA_MINUTOS']).astype(int)
+            df['CUMPLE_SLA'] = (df['MINUTOS_REALES'] <= df['SLA_MINUTOS']).astype(int)
             
-        #Extraer el tiempo promedio historico de resolucion (ignorando valores nulos o negativos)
+        # Extraer el tiempo promedio historico de resolucion (ignorando valores nulos o negativos)
         if 'MINUTOS_REALES' in df.columns:
-            tiempo_promedio = df.loc[df['MINUTOS_rEALES'] > 0, 'MINUTOS_REALES'].mean()
+            validos = df.loc[df['MINUTOS_REALES'] > 0, 'MINUTOS_REALES']
+            tiempo_promedio = float(validos.mean()) if not validos.empty and not pd.isna(validos.mean()) else 45.0
         else:
             tiempo_promedio = 45.0
         
@@ -82,18 +94,18 @@ async def upload_file(file: UploadFile = File (...)):
             df_agrupado.set_index('FECHA_CORTA', inplace=True)
             
             # Rellenar fechas vacias con 0
-            idx = pd.data_range(df_agrupado.index.min(), df_agrupado.index.max())
-            df_agrupado = df_agrupado.reindez(idx).fillna({'cantidad_incidentes': 0, 'tasa_cumplimiento_sla': 1.0})
+            idx = pd.date_range(df_agrupado.index.min(), df_agrupado.index.max())
+            df_agrupado = df_agrupado.reindex(idx).fillna({'cantidad_incidentes': 0, 'tasa_cumplimiento_sla': 1.0})
             df_agrupado.reset_index(inplace=True)
             df_agrupado.rename(columns={'index': 'fecha'}, inplace=True)
             
             # Guardar tiempo promedio en un archivo auxiliar para usarlo en la proyeccion
-            with open ("data/tiempo_promedio.txt", "w") as f:
+            with open("data/tiempo_promedio.txt", "w") as f:
                 f.write(str(tiempo_promedio))
                 
             df_agrupado.to_csv("data/incidentes_limpios.csv", index=False)
             
-            return{
+            return {
                 "mensaje": "Cruce con SLA exitoso y datos agrupados.",
                 "total_incidentes": int(df_agrupado['cantidad_incidentes'].sum()),
                 "tiempo_promedio_historico": round(tiempo_promedio, 2),
@@ -101,6 +113,8 @@ async def upload_file(file: UploadFile = File (...)):
             }
         else:
             raise HTTPException(status_code=400, detail="No se encontro la columna de fecha de creacion.")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {str(e)}")
 #async def upload_file(file: UploadFile = File(...)):
@@ -416,10 +430,15 @@ async def train_models(horizonte: int = 30):
     
     # Leer el tiempo promedio historico guardado
     tiempo_prom_historico = 45.0 # Valor por defecto de seguridad
-    if os.path.exist("data/tiempo_promedio.txt"):
+    posibles_rutas_tiempo = [
+        "data/tiempo_promedio.txt",
+        os.path.join(os.path.dirname(__file__), "data", "tiempo_promedio.txt")
+    ]
+    ruta_tiempo = next((p for p in posibles_rutas_tiempo if os.path.exists(p)), None)
+    if ruta_tiempo:
         try:
-            with open("data/tiempo_promedio.txt", "r") as f:
-                tiempo_prom_historico = float(f.read())
+            with open(ruta_tiempo, "r") as f:
+                tiempo_prom_historico = float(f.read().strip())
         except Exception:
             pass     
     return {
