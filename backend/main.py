@@ -22,66 +22,147 @@ os.makedirs("data", exist_ok=True)
 processed_data_cache = None
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    global processed_data_cache
-    if not file.filename.endswith(('.xls', '.xlsx')):
-        raise HTTPException(status_code=400, detail="Solo se permiten archivos Excel (.xls, .xlsx)")
-    
-    contents = await file.read()
+async def upload_file(file: UploadFile = File (...)):
     try:
+        contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
         
-        # 1. Estandarizar columnas a minúsculas para encontrar los datos más fácil
-        df.columns = df.columns.str.lower().str.strip()
+        # 1. Cargar matriz SLA
+        ruta_sla = os.path.join(os.path.dirname(__file__),"data", "sla_atencion_soporte.xlsx")
+        print(f"Buscando SLA en: {ruta_sla}")
         
-        # 2. Buscar columna de tipo de ticket y fecha dinámicamente
-        tipo_col = next((col for col in df.columns if 'tipo' in col or 'type' in col or 'clasificacion' in col), None)
-        fecha_col = next((col for col in df.columns if 'fecha' in col or 'date' in col or 'creacion' in col or 'creación' in col), None)
+        if not os.path.exists(ruta_sla):
+            if os.path.exists(os.path.dirname(ruta_sla)):
+             print (f"Archivos en carpeta data: {os.listdir(os.path.dirname(ruta_sla))}")
+            raise HTTPException(status_code=500, detail="Falta el archivo maestro SLA en el servidor.")
         
-        if not fecha_col:
-            # Fallback: tomar la primera columna que sea tipo datetime
-            for col in df.columns:
-                if pd.core.dtypes.common.is_datetime_or_timedelta_dtype(df[col]):
-                    fecha_col = col
-                    break
-            if not fecha_col:
-                raise HTTPException(status_code=400, detail="No se encontró una columna de fecha en el Excel para agrupar en el tiempo.")
+        df_sla = pd.read_excel(ruta_sla)
+        
+        #Estandarizar nombres de columnas
+        df.columns = df.columns.str.strip().str.upper()
+        df_sla.columns = df_sla.columns.str.strip().str.upper()
+        
+        # 2. Filtrar solo incidencias y solicitudes (excluir tareas programadas)
+        if 'Tipo' in df.columns:
+            df = df[df['TIPO'].astype(str).str.upper().isin(['INCIDENTE','SOLICITUD'])]  
+        
+        # 3. Cruce de dataframes por Categoria
+        if 'CATEGORIA' in df.columns and 'CATEGORIA' in df_sla.columns:
+            df = df.merge(df_sla[['CATEGORIA','SLA_MINUTOS']], on='CATEGORIA', how='left')
+        else:
+            df['SLA_MINUTOS'] = 120 #Valor por defecto si fallan las columnas
             
-        # 3. Limpiar y Filtrar
-        if tipo_col:
-            df = df[df[tipo_col].astype(str).str.lower().str.contains("incidente|incident", na=False)]
+        # 4. Calculo de tiempos reales y cumplimiento SLA
+        if 'FECHAHORACREACION' in df.columns and 'FECHAHORACIERRE' in df.columns:
+            df['FECHAHORACREACION'] = pd.to_Datetime(df['FECHAHORACREACION'], errors='coerce')
+            df['FECHAHORACIERRE'] = pd.to_datetime (df['FECHAHORACIERRE'],errors='coerce')
             
-        # 4. Asegurar formato de fecha
-        df[fecha_col] = pd.to_datetime(df[fecha_col], errors='coerce')
-        df = df.dropna(subset=[fecha_col])
+            #Calcular minutos reales
+            df['MINUTOS_REALES'] = (df['FECHAHORACIERRE'] - df['FECHAHORACREACION']).dt.total_seconds() / 60
+            
+            # Etiquetar cumplimiento (1 = cumple, 0 = no cumple)
+            df ['CUMPLE_SLA'] = (df['MINUTOS_REALES'] <= df['SLA_MINUTOS']).astype(int)
+            
+        #Extraer el tiempo promedio historico de resolucion (ignorando valores nulos o negativos)
+        if 'MINUTOS_REALES' in df.columns:
+            tiempo_promedio = df.loc[df['MINUTOS_rEALES'] > 0, 'MINUTOS_REALES'].mean()
+        else:
+            tiempo_promedio = 45.0
         
-        # 5. Agrupar por día
-        df['fecha_corta'] = df[fecha_col].dt.date
-        df_agrupado = df.groupby('fecha_corta').size().reset_index(name='cantidad_incidentes')
-        df_agrupado = df_agrupado.sort_values('fecha_corta')
-        df_agrupado['fecha_corta'] = pd.to_datetime(df_agrupado['fecha_corta'])
-        df_agrupado.set_index('fecha_corta', inplace=True)
-        
-        # Rellenar fechas vacías con 0 incidentes para tener una serie temporal continua
-        idx = pd.date_range(df_agrupado.index.min(), df_agrupado.index.max())
-        df_agrupado = df_agrupado.reindex(idx, fill_value=0)
-        df_agrupado.reset_index(inplace=True)
-        df_agrupado.rename(columns={'index': 'fecha'}, inplace=True)
-        
-        processed_data_cache = df_agrupado
-        
-        # Guardar copia limpia temporal
-        df_agrupado.to_csv("data/incidentes_limpios.csv", index=False)
-        
-        return {
-            "mensaje": "Archivo procesado y limpiado correctamente.",
-            "total_incidentes": int(df_agrupado['cantidad_incidentes'].sum()),
-            "dias_registrados": len(df_agrupado),
-            "head": df_agrupado.head(5).to_dict(orient="records")
-        }
-        
+        # 5. Agrupar por dia para el entrenamiento de ML
+        if 'FECHAHORACREACION' in df.columns:
+            df['FECHA_CORTA'] = df['FECHAHORACREACION'].dt.date
+            df_agrupado = df.groupby('FECHA_CORTA').agg(
+                cantidad_incidentes=('TICKETID', 'count'),
+                tasa_cumplimiento_sla=('CUMPLE_SLA','mean')
+            ).reset_index()
+            
+            df_agrupado = df_agrupado.sort_values('FECHA_CORTA')
+            df_agrupado['FECHA_CORTA'] = pd.to_datetime(df_agrupado['FECHA_CORTA'])
+            df_agrupado.set_index('FECHA_CORTA', inplace=True)
+            
+            # Rellenar fechas vacias con 0
+            idx = pd.data_range(df_agrupado.index.min(), df_agrupado.index.max())
+            df_agrupado = df_agrupado.reindez(idx).fillna({'cantidad_incidentes': 0, 'tasa_cumplimiento_sla': 1.0})
+            df_agrupado.reset_index(inplace=True)
+            df_agrupado.rename(columns={'index': 'fecha'}, inplace=True)
+            
+            # Guardar tiempo promedio en un archivo auxiliar para usarlo en la proyeccion
+            with open ("data/tiempo_promedio.txt", "w") as f:
+                f.write(str(tiempo_promedio))
+                
+            df_agrupado.to_csv("data/incidentes_limpios.csv", index=False)
+            
+            return{
+                "mensaje": "Cruce con SLA exitoso y datos agrupados.",
+                "total_incidentes": int(df_agrupado['cantidad_incidentes'].sum()),
+                "tiempo_promedio_historico": round(tiempo_promedio, 2),
+                "dias_registrados": len(df_agrupado)
+            }
+        else:
+            raise HTTPException(status_code=400, detail="No se encontro la columna de fecha de creacion.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {str(e)}")
+#async def upload_file(file: UploadFile = File(...)):
+ #   global processed_data_cache
+  #  if not file.filename.endswith(('.xls', '.xlsx')):
+   #     raise HTTPException(status_code=400, detail="Solo se permiten archivos Excel (.xls, .xlsx)")
+    
+    #contents = await file.read()
+    #try:
+     #   df = pd.read_excel(io.BytesIO(contents))
+        
+        # 1. Estandarizar columnas a minúsculas para encontrar los datos más fácil
+      #  df.columns = df.columns.str.lower().str.strip()
+        
+        # 2. Buscar columna de tipo de ticket y fecha dinámicamente
+       # tipo_col = next((col for col in df.columns if 'tipo' in col or 'type' in col or 'clasificacion' in col), None)
+        #fecha_col = next((col for col in df.columns if 'fecha' in col or 'date' in col or 'creacion' in col or 'creación' in col), None)
+        
+        #if not fecha_col:
+            # Fallback: tomar la primera columna que sea tipo datetime
+         #   for col in df.columns:
+          #      if pd.core.dtypes.common.is_datetime_or_timedelta_dtype(df[col]):
+           #         fecha_col = col
+            #        break
+           # if not fecha_col:
+            #    raise HTTPException(status_code=400, detail="No se encontró una columna de fecha en el Excel para agrupar en el tiempo.")
+            
+        # 3. Limpiar y Filtrar
+       # if tipo_col:
+        #    df = df[df[tipo_col].astype(str).str.lower().str.contains("incidente|incident", na=False)]
+            
+        # 4. Asegurar formato de fecha
+       # df[fecha_col] = pd.to_datetime(df[fecha_col], errors='coerce')
+       # df = df.dropna(subset=[fecha_col])
+        
+        # 5. Agrupar por día
+       # df['fecha_corta'] = df[fecha_col].dt.date
+       # df_agrupado = df.groupby('fecha_corta').size().reset_index(name='cantidad_incidentes')
+        #df_agrupado = df_agrupado.sort_values('fecha_corta')
+        #df_agrupado['fecha_corta'] = pd.to_datetime(df_agrupado['fecha_corta'])
+        #df_agrupado.set_index('fecha_corta', inplace=True)
+        
+        # Rellenar fechas vacías con 0 incidentes para tener una serie temporal continua
+        #idx = pd.date_range(df_agrupado.index.min(), df_agrupado.index.max())
+        #df_agrupado = df_agrupado.reindex(idx, fill_value=0)
+        #df_agrupado.reset_index(inplace=True)
+        #df_agrupado.rename(columns={'index': 'fecha'}, inplace=True)
+        
+        #processed_data_cache = df_agrupado
+        
+        # Guardar copia limpia temporal
+       # df_agrupado.to_csv("data/incidentes_limpios.csv", index=False)
+        
+       # return {
+       #     "mensaje": "Archivo procesado y limpiado correctamente.",
+      #      "total_incidentes": int(df_agrupado['cantidad_incidentes'].sum()),
+     #       "dias_registrados": len(df_agrupado),
+    #        "head": df_agrupado.head(5).to_dict(orient="records")
+   #     }
+        
+  #  except Exception as e:
+ #       raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {str(e)}")
 
 @app.get("/download-clean")
 async def download_clean():
@@ -332,7 +413,15 @@ async def train_models(horizonte: int = 30):
         df_futuro['dia_ordinal'] = df_futuro['fecha'].map(pd.Timestamp.toordinal)
         preds = xgb_final.predict(df_futuro[['dia_ordinal']])
         predicciones_futuro = [max(0, int(p)) for p in preds]
-        
+    
+    # Leer el tiempo promedio historico guardado
+    tiempo_prom_historico = 45.0 # Valor por defecto de seguridad
+    if os.path.exist("data/tiempo_promedio.txt"):
+        try:
+            with open("data/tiempo_promedio.txt", "r") as f:
+                tiempo_prom_historico = float(f.read())
+        except Exception:
+            pass     
     return {
         "modelos_evaluados": [{"nombre": m['nombre'], "mae": round(m['mae'], 2), "rmse": round(m['rmse'], 2), "r2": round(m['r2'], 4)} for m in resultados_modelos],
         "mejor_modelo": mejor_modelo_info['nombre'],
@@ -340,5 +429,6 @@ async def train_models(horizonte: int = 30):
         "fechas_historicas": df['fecha'].dt.strftime("%Y-%m-%d").tolist(),
         "valores_historicos": df['cantidad_incidentes'].tolist(),
         "fechas_proyectadas": [f.strftime("%Y-%m-%d") for f in fechas_futuro],
-        "valores_proyectados": predicciones_futuro
+        "valores_proyectados": predicciones_futuro,
+        "tiempo_promedio_historico": tiempo_prom_historico #NUEVA LINEA AÑADIDA
     }

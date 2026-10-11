@@ -121,21 +121,58 @@ if st.session_state.get('forecast_data'):
             st.dataframe(eval_df.style.highlight_min(subset=['mae'], color='lightgreen'), use_container_width=True)
         
     with col_der:
-        st.subheader("Datos Proyectados (Futuro)")
-        df_proy = pd.DataFrame({
-            'Fecha': fechas_proy.strftime("%Y-%m-%d"),
-            'Incidentes Estimados': valores_proy
+        st.subheader("Planificacion de Personal (Capacidad)")
+        
+        #Parametro operativo_ Horas productivas por tecnico al dia
+        horas_productivas = st.slider("Horas utiles por tecnico al dia (Sin refrigerio)", min_value=4.0, max_value=8.0,value=6.5, step=0.5)
+        
+        #Recuperar el tiempo promedio que mando el backend
+        tiempo_prom_minutos = fdata.get('tiempo_promedio_historico', 45.0)
+        st.markdown(f"**Tiempo medio historico por ticket:** {round(tiempo_prom_minutos, 1)} minutos")
+        
+        #Calcular capacidad necesaria
+        df_capacidad = pd.DataFrame({
+            'Fecha': fechas_proy.dt.strftime("%Y-%m-%d") if hasattr(fechas_proy, 'dt') else pd.to_datetime(fechas_proy).strftime("%Y-%m-%d"),
+            'Tickets Estimados': valores_proy
         })
-        st.dataframe(df_proy, use_container_width=True)
+        
+        # Formula: (Tickets * Minutos) / 60 = Horas necesarias. Luego Horas necesarias / Horas Productivas por persona
+        df_capacidad['Carga(Horas)'] = (df_capacidad['Tickets Estimados'] * tiempo_prom_minutos) / 60
+        # Redondeo hacia arriba para asegurar que siempre haya suficiente personal
+        df_capacidad['Tecnicos Requeridos'] = (df_capacidad['Carga (Horas)'] / horas_productivas).apply(lambda x: max(1, int(x + 0.99)))
+        
+        # Formato visual
+        df_capacidad['Carga (Horas)'] = df_capacidad['Carga (Horas)'].round(1)
+        
+        # Mostrar tabla coloreada
+        st.dataframe(
+            df_capacidad.style.backgorund_gradient(subset=['Tecnicos Requeridos'], cmap='Oranges'),
+            use_container_width=True
+        )
+        
+        # Boton de Descarga
+        csv_capacidad = df_capacidad.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Descargar Plan de Personal CSV",
+            data=csv_capacidad,
+            file_name='plan_capacidad_soporte.csv',
+            nime='text/csv',
+        ) 
+      #  st.subheader("Datos Proyectados (Futuro)")
+       # df_proy = pd.DataFrame({
+        #    'Fecha': fechas_proy.strftime("%Y-%m-%d"),
+         #   'Incidentes Estimados': valores_proy
+        #})
+        #st.dataframe(df_proy, use_container_width=True)
         
         # Botón de Descarga
-        csv = df_proy.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Descargar Proyección como CSV",
-            data=csv,
-            file_name='proyeccion_incidentes.csv',
-            mime='text/csv',
-        )
+        #csv = df_proy.to_csv(index=False).encode('utf-8')
+        #st.download_button(
+         #   label="Descargar Proyección como CSV",
+          #  data=csv,
+           # file_name='proyeccion_incidentes.csv',
+            #mime='text/csv',
+        #)
 else:
     # Pantalla de inicio si no hay datos
     st.info("👈 Comienza subiendo un archivo de Excel desde el panel lateral y procesa los datos.")
