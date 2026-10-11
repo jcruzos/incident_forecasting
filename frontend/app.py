@@ -149,11 +149,14 @@ if st.session_state.get('forecast_data'):
         # Formato visual
         df_capacidad['Carga (Horas)'] = df_capacidad['Carga (Horas)'].round(1)
         
-        # Mostrar tabla coloreada
-        st.dataframe(
-            df_capacidad.style.background_gradient(subset=['Tecnicos Requeridos'], cmap='Oranges'),
-            use_container_width=True
-        )
+        # Mostrar tabla coloreada (con fallback si falta matplotlib)
+        try:
+            st.dataframe(
+                df_capacidad.style.background_gradient(subset=['Tecnicos Requeridos'], cmap='Oranges'),
+                use_container_width=True
+            )
+        except Exception:
+            st.dataframe(df_capacidad, use_container_width=True)
         
         # Boton de Descarga
         csv_capacidad = df_capacidad.to_csv(index=False).encode('utf-8')
