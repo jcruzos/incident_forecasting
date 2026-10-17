@@ -96,7 +96,12 @@ def construir_features_temporales(df_in: pd.DataFrame, target_col: str = "cantid
 
 def predecir_recursivo_arbol(modelo, df_completo: pd.DataFrame, fechas_futuro: pd.DatetimeIndex, target_col: str, feature_cols: list) -> list:
     """Realiza una proyección autorregresiva recursiva multi-paso para modelos de Machine Learning (RF / XGBoost / Linear)."""
-    df_sim = df_completo[['fecha', target_col, 'tasa_cumplimiento_sla', 'cantidad_pos']].copy() if 'tasa_cumplimiento_sla' in df_completo.columns and 'cantidad_pos' in df_completo.columns else df_completo[['fecha', target_col]].copy()
+    cols_base = ['fecha', target_col]
+    if 'tasa_cumplimiento_sla' in df_completo.columns and 'tasa_cumplimiento_sla' not in cols_base:
+        cols_base.append('tasa_cumplimiento_sla')
+    if 'cantidad_pos' in df_completo.columns and 'cantidad_pos' not in cols_base:
+        cols_base.append('cantidad_pos')
+    df_sim = df_completo[cols_base].copy()
     
     if 'tasa_cumplimiento_sla' not in df_sim.columns:
         df_sim['tasa_cumplimiento_sla'] = 1.0
@@ -107,12 +112,13 @@ def predecir_recursivo_arbol(modelo, df_completo: pd.DataFrame, fechas_futuro: p
     
     for f in fechas_futuro:
         # Fila temporal para el paso futuro
-        nueva_fila = pd.DataFrame([{
+        fila_dict = {
             'fecha': f,
             target_col: np.nan,
             'tasa_cumplimiento_sla': float(df_sim['tasa_cumplimiento_sla'].iloc[-7:].mean()),
             'cantidad_pos': float(df_sim['cantidad_pos'].iloc[-7:].mean())
-        }])
+        }
+        nueva_fila = pd.DataFrame([fila_dict])
         df_temp = pd.concat([df_sim, nueva_fila], ignore_index=True)
         
         # Calcular features en la fila más reciente
@@ -568,3 +574,124 @@ async def train_models(horizonte: int = 30, tipo_serie: str = "todos"):
         "fechas_proyectadas": [f.strftime("%Y-%m-%d") for f in fechas_futuro],
         "tiempo_promedio_historico": round(tiempo_prom_historico, 2)
     }
+
+
+@app.get("/evaluar-mayo")
+async def evaluar_mayo_endpoint(tipo_serie: str = "todos"):
+    """
+    Evalúa la exactitud y precisión de los modelos predictivos utilizando
+    la data real de tickets del mes de mayo (TICKETS_MAYO.xlsx).
+    """
+    posibles_rutas_mayo = [
+        os.path.join("data", "TICKETS_MAYO.xlsx"),
+        os.path.join(os.path.dirname(__file__), "data", "TICKETS_MAYO.xlsx"),
+        os.path.join(".", "TICKETS_MAYO.xlsx"),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "TICKETS_MAYO.xlsx")
+    ]
+    ruta_mayo = next((p for p in posibles_rutas_mayo if os.path.exists(p)), None)
+    if not ruta_mayo:
+        raise HTTPException(status_code=404, detail="Archivo TICKETS_MAYO.xlsx no encontrado en el servidor.")
+        
+    try:
+        df_mayo = pd.read_excel(ruta_mayo)
+        df_mayo.columns = df_mayo.columns.str.strip().str.upper()
+        df_mayo['FECHAHORACREACION'] = pd.to_datetime(df_mayo['FECHAHORACREACION'], errors='coerce')
+        df_mayo['FECHA_CORTA'] = pd.to_datetime(df_mayo['FECHAHORACREACION'].dt.date)
+        df_mayo['TIPO_STR'] = df_mayo['TIPO'].astype(str).str.upper() if 'TIPO' in df_mayo.columns else ""
+        df_mayo['SERVICE_STR'] = df_mayo['TIPOSERVICE'].astype(str).str.upper() if 'TIPOSERVICE' in df_mayo.columns else ""
+        
+        agrup_mayo = df_mayo.groupby('FECHA_CORTA').agg(
+            cantidad_total=('TICKETID', 'count') if 'TICKETID' in df_mayo.columns else ('FECHA_CORTA', 'count'),
+            cantidad_incidentes=('TIPO_STR', lambda x: (x == 'INCIDENTE').sum()),
+            cantidad_solicitudes=('TIPO_STR', lambda x: (x == 'SOLICITUD').sum()),
+            cantidad_pos=('SERVICE_STR', lambda x: (x.str.contains('POS|ERP', na=False)).sum())
+        )
+        # Asegurar rango de 31 días de mayo
+        fechas_mayo = pd.date_range('2026-05-01', '2026-05-31')
+        agrup_mayo = agrup_mayo.reindex(fechas_mayo).fillna(0).reset_index()
+        agrup_mayo.rename(columns={'index': 'fecha'}, inplace=True)
+        
+        mapeo_cols = {
+            "todos": "cantidad_total",
+            "incidentes": "cantidad_incidentes",
+            "solicitudes": "cantidad_solicitudes",
+            "pos": "cantidad_pos"
+        }
+        col_target = mapeo_cols.get(tipo_serie.lower(), "cantidad_total")
+        if col_target not in agrup_mayo.columns:
+            col_target = "cantidad_total"
+            
+        y_real = agrup_mayo[col_target].values
+        total_real = int(y_real.sum())
+        promedio_real = float(y_real.mean())
+        
+        # Entrenar y obtener pronóstico a 31 días
+        train_res = await train_models(horizonte=31, tipo_serie=tipo_serie)
+        predicciones_dict = train_res['predicciones_por_modelo']
+        
+        ranking = []
+        for mod_nom, p_list in predicciones_dict.items():
+            p_arr = np.array(p_list)[:31]
+            mae = float(mean_absolute_error(y_real, p_arr))
+            rmse = float(np.sqrt(mean_squared_error(y_real, p_arr)))
+            
+            mask = y_real > 0
+            mape = float(np.mean(np.abs((y_real[mask] - p_arr[mask]) / y_real[mask])) * 100) if np.any(mask) else 0.0
+            wape = float(np.sum(np.abs(y_real - p_arr)) / np.sum(y_real) * 100) if np.sum(y_real) > 0 else 0.0
+            exactitud = max(0.0, 100.0 - wape)
+            r2 = float(r2_score(y_real, p_arr))
+            
+            tot_proy = int(p_arr.sum())
+            dif_tickets = tot_proy - total_real
+            error_vol_pct = round((dif_tickets / total_real) * 100, 2) if total_real > 0 else 0.0
+            
+            ranking.append({
+                "modelo": mod_nom,
+                "total_proyectado": tot_proy,
+                "dif_tickets": dif_tickets,
+                "error_volumen_pct": error_vol_pct,
+                "mae": round(mae, 2),
+                "rmse": round(rmse, 2),
+                "mape": round(mape, 2),
+                "exactitud_wape": round(exactitud, 2),
+                "r2": round(r2, 4),
+                "predicciones": p_arr.tolist()
+            })
+            
+        ranking.sort(key=lambda x: x['mae'])
+        mejor_por_mae = ranking[0]['modelo']
+        mejor_por_volumen = min(ranking, key=lambda x: abs(x['error_volumen_pct']))['modelo']
+        
+        # Detalle diario
+        detalle_diario = []
+        for i, f in enumerate(fechas_mayo):
+            f_str = f.strftime("%Y-%m-%d")
+            fila = {
+                "fecha": f_str,
+                "dia_semana": f.strftime("%A"),
+                "real": int(y_real[i])
+            }
+            for mod_nom, p_list in predicciones_dict.items():
+                fila[mod_nom] = int(p_list[i]) if i < len(p_list) else 0
+            detalle_diario.append(fila)
+            
+        return {
+            "tipo_serie": tipo_serie,
+            "columna_evaluada": col_target,
+            "resumen_real": {
+                "total_tickets_mayo": total_real,
+                "promedio_diario": round(promedio_real, 1),
+                "dias_evaluados": len(fechas_mayo),
+                "fecha_inicio": "2026-05-01",
+                "fecha_fin": "2026-05-31"
+            },
+            "mejor_modelo_exactitud_diaria": mejor_por_mae,
+            "mejor_modelo_volumen_mensual": mejor_por_volumen,
+            "ranking_modelos": ranking,
+            "fechas": [f.strftime("%Y-%m-%d") for f in fechas_mayo],
+            "valores_reales": [int(v) for v in y_real],
+            "detalle_diario": detalle_diario
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error evaluando con datos de Mayo: {str(e)}")
+
